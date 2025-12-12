@@ -13,7 +13,7 @@ class PortalBackend:
 
     def _get_context(self):
         playwright = sync_playwright().start()
-        browser = playwright.chromium.launch(headless=True)
+        browser = playwright.chromium.launch(headless=False)
         context = browser.new_context()
         
         # Load cookies
@@ -51,7 +51,7 @@ class PortalBackend:
         courses = []
         try:
             # Navigate to dashboard
-            page.goto(f"{self.BASE_URL}/Dashboard")
+            page.goto(f"{self.BASE_URL}/Web/MyWorkspaces/")
             
             # Wait for items to verify load
             try:
@@ -154,7 +154,7 @@ class PortalBackend:
             course_url = lecture_data.get('course_url')
             if not course_url:
                 print("No course URL in lecture data.")
-                return None # Will fall through to finally
+                return None 
 
             trigger_page.goto(course_url)
             trigger_page.wait_for_selector('div.instanceResource', timeout=15000)
@@ -175,27 +175,74 @@ class PortalBackend:
             video_page = new_page_info.value
             video_page.wait_for_load_state()
 
-            # The Sniff
-            def on_request(request):
-                nonlocal found_url
-                if not found_url and request.url.endswith('.m3u8'):
-                    found_url = request.url
-
-            video_page.on("request", on_request)
-            
+            # Handle Flutter
             try:
-                # Wait for video to ensure requests are firing
-                video_page.wait_for_selector('video', timeout=20000)
+                print("Waiting for Flutter to initialize...")
+                # Flutter apps render into a <flutter-view>
+                video_page.wait_for_selector('flutter-view', timeout=30000)
                 
-                # Wait loop for request
-                start_time = time.time()
-                while not found_url:
-                    if time.time() - start_time > 15:
-                        print("Timeout waiting for m3u8.")
-                        break
-                    video_page.wait_for_timeout(200)
+                # Sniffing setup
+                def on_request(request):
+                    nonlocal found_url
+                    if not found_url and (request.url.endswith('.m3u8') or request.url.endswith('.mpd')):
+                        found_url = request.url
+
+                video_page.on("request", on_request)
+
+                # Fix: Click 'Enable accessibility' if present to hydrate the semantic tree
+                try:
+                    semantics_btn = video_page.get_by_label("Enable accessibility")
+                    if semantics_btn.is_visible(timeout=3000):
+                        print("Clicking 'Enable accessibility' to wake up Flutter semantics...")
+                        semantics_btn.click()
+                        video_page.wait_for_timeout(2000) # Give it time to rebuild
+                except:
+                    pass
+
+                print("Looking for playback button...")
+                playback_button = None
+                
+                # Strategy 1: Role
+                try:
+                    btn = video_page.get_by_role("button", name="Playback the recording")
+                    btn.wait_for(state="visible", timeout=3000)
+                    playback_button = btn
+                except:
+                    pass
+                
+                # Strategy 2: Text
+                if not playback_button:
+                    try:
+                        btn = video_page.get_by_text("Playback the recording")
+                        btn.wait_for(state="visible", timeout=3000)
+                        playback_button = btn
+                    except:
+                        pass
+                
+                if playback_button:
+                    print("Clicking playback button...")
+                    playback_button.click()
+                    
+                    # Wait loop for request
+                    print("Waiting for stream URL...")
+                    start_time = time.time()
+                    while not found_url:
+                        if time.time() - start_time > 30:
+                            print("Timeout waiting for m3u8/mpd.")
+                            break
+                        video_page.wait_for_timeout(500)
+                else:
+                    print("Could not find 'Playback the recording' button.")
+                    # Debug screenshot if we fail
+                    try:
+                        os.makedirs("debug_screenshots", exist_ok=True)
+                        video_page.screenshot(path=f"debug_screenshots/flutter_fail_{int(time.time())}.png")
+                        print("Screenshot saved to debug_screenshots/")
+                    except:
+                        pass
+
             except Exception as e:
-                print(f"Error on video page: {e}")
+                print(f"Error on Flutter page: {e}")
             finally:
                 video_page.close()
 
