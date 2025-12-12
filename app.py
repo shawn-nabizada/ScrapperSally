@@ -12,6 +12,12 @@ with st.sidebar:
     if st.button("Load Courses"):
         with st.spinner("Loading courses..."):
             st.session_state.courses = st.session_state.backend.get_courses()
+    
+    st.divider()
+    if st.button("Reset Browser Session"):
+        st.session_state.backend.close_session()
+        st.cache_resource.clear()
+        st.rerun()
 
 # Main Area
 st.title("University Class Downloader")
@@ -42,31 +48,40 @@ if 'courses' in st.session_state and st.session_state.courses:
         if st.button("Download"):
             selected_recording = recording_options[selected_recording_name]
             
-            with st.spinner("Finding stream URL..."):
-                stream_url = st.session_state.backend.get_video_stream(selected_recording)
+            with st.spinner("Finding stream URLs (Part 1 - Scrubbing)..."):
+                stream_urls = st.session_state.backend.get_video_stream(selected_recording)
             
-            if stream_url:
-                st.success(f"Stream found: {stream_url}")
-                st.info("Starting download...")
+            if stream_urls:
+                st.success(f"Found {len(stream_urls)} potential streams!")
+                st.info("Starting robust downloads...")
                 
                 # Ensure Downloads directory exists
                 os.makedirs("Downloads", exist_ok=True)
                 
-                # Run yt-dlp
-                command = [
-                    "uv", "run", "yt-dlp",
-                    "-o", "Downloads/%(title)s.%(ext)s",
-                    stream_url
-                ]
-                
-                try:
-                    with st.spinner("Downloading..."):
-                        subprocess.run(command, check=True)
-                    st.success("Download complete!")
-                except subprocess.CalledProcessError as e:
-                    st.error(f"Download failed: {e}")
+                # Iterate and Download
+                for idx, stream_url in enumerate(stream_urls):
+                    st.write(f"Downloading Stream #{idx+1}...")
+                    
+                    # Robust yt-dlp Command (The Impersonator Strategy)
+                    command = [
+                        "uv", "run", "yt-dlp",
+                        "--force-ipv4",             # Fix IPv6 timeouts (OVH/AWS)
+                        "--cookies", "cookies.txt", # Auth
+                        "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                        "--live-from-start",        # Get full history
+                        "-x", "--audio-format", "mp3",
+                        "-o", f"Downloads/%(title)s_part_{idx+1}.%(ext)s", # Prevent overwrite
+                        stream_url
+                    ]
+                    
+                    try:
+                        with st.spinner(f"Downloading Part {idx+1}..."):
+                            subprocess.run(command, check=True)
+                        st.success(f"Part {idx+1} complete!")
+                    except subprocess.CalledProcessError as e:
+                        st.error(f"Download failed for Part {idx+1}: {e}")
             else:
-                st.error("Could not find stream URL.")
+                st.error("Could not find any stream URLs.")
 
 else:
     st.info("Please load courses from the sidebar to begin.")

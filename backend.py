@@ -1,5 +1,6 @@
 import time
 import os
+import threading
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
 
@@ -10,40 +11,68 @@ class PortalBackend:
 
     def __init__(self, cookies_path):
         self.cookies_path = cookies_path
+        self.playwright = None
+        self.browser = None
+        self.context = None
+        self._thread_id = None
 
     def _get_context(self):
-        playwright = sync_playwright().start()
-        browser = playwright.chromium.launch(headless=False)
-        context = browser.new_context()
+        # Check for thread mismatch and restart if necessary (Streamlit safety)
+        if self.playwright and self._thread_id != threading.get_ident():
+            print("Thread mismatch detected (Streamlit re-run). Restarting Playwright session...")
+            self.close_session()
+
+        if not self.playwright:
+             self.playwright = sync_playwright().start()
+             self._thread_id = threading.get_ident()
         
-        # Load cookies
-        cookies = []
-        try:
-            with open(self.cookies_path, 'r') as f:
-                for line in f:
-                    if line.startswith('#') or not line.strip():
-                        continue
-                    parts = line.strip().split('\t')
-                    if len(parts) >= 7:
-                        # Netscape format: domain, flag, path, secure, expiration, name, value
-                        try:
-                            cookie = {
-                                'domain': parts[0],
-                                'path': parts[2],
-                                'secure': parts[3].upper() == 'TRUE',
-                                'expires': float(parts[4]),
-                                'name': parts[5],
-                                'value': parts[6]
-                            }
-                            cookies.append(cookie)
-                        except ValueError:
-                            continue
-            if cookies:
-                context.add_cookies(cookies)
-        except Exception as e:
-            print(f"Failed to load cookies: {e}")
+        if not self.browser:
+             self.browser = self.playwright.chromium.launch(headless=False)
+             
+        if not self.context:
+             self.context = self.browser.new_context()
+             # Load cookies
+             cookies = []
+             try:
+                 with open(self.cookies_path, 'r') as f:
+                     for line in f:
+                         if line.startswith('#') or not line.strip():
+                             continue
+                         parts = line.strip().split('\t')
+                         if len(parts) >= 7:
+                             try:
+                                 cookie = {
+                                     'domain': parts[0],
+                                     'path': parts[2],
+                                     'secure': parts[3].upper() == 'TRUE',
+                                     'expires': float(parts[4]),
+                                     'name': parts[5],
+                                     'value': parts[6]
+                                 }
+                                 cookies.append(cookie)
+                             except ValueError:
+                                 continue
+                 if cookies:
+                     self.context.add_cookies(cookies)
+             except Exception as e:
+                 print(f"Failed to load cookies: {e}")
             
-        return playwright, browser, context
+        return self.playwright, self.browser, self.context
+
+    def close_session(self):
+        if self.context:
+            try: self.context.close()
+            except: pass
+            self.context = None
+        if self.browser:
+            try: self.browser.close()
+            except: pass
+            self.browser = None
+        if self.playwright:
+            try: self.playwright.stop()
+            except: pass
+            self.playwright = None
+            self._thread_id = None
 
     def get_courses(self):
         playwright, browser, context = self._get_context()
@@ -148,13 +177,13 @@ class PortalBackend:
         playwright, browser, context = self._get_context()
         
         trigger_page = context.new_page()
-        found_url = None
+        found_urls = []
         
         try:
             course_url = lecture_data.get('course_url')
             if not course_url:
                 print("No course URL in lecture data.")
-                return None 
+                return []
 
             trigger_page.goto(course_url)
             trigger_page.wait_for_selector('div.instanceResource', timeout=15000)
@@ -181,77 +210,159 @@ class PortalBackend:
                 # Flutter apps render into a <flutter-view>
                 video_page.wait_for_selector('flutter-view', timeout=30000)
                 
-                # Sniffing setup
-                def on_request(request):
-                    nonlocal found_url
-                    if not found_url and (request.url.endswith('.m3u8') or request.url.endswith('.mpd')):
-                        found_url = request.url
+                # Sniffing setup: Broad Spectrum (WebSockets + Response Inspection)
+                def on_websocket(ws):
+                    print(f">> WEBSOCKET: {ws.url}")
 
-                video_page.on("request", on_request)
+                video_page.on("websocket", on_websocket)
 
-                # Fix: Click 'Enable accessibility' if present to hydrate the semantic tree
+                def on_response(response):
+                    nonlocal found_urls
+                    try:
+                        url = response.url
+                        ct = response.headers.get("content-type", "").lower()
+                        
+                        # Filter noise
+                        if any(x in ct for x in ["image", "css", "font", "javascript", "svg", "woff"]):
+                            return
+
+                        # 1. Verbose Logging
+                        print(f">> TRAFFIC: [{ct}] {url}")
+
+                        # 2. Keyword Search
+                        if any(k in url.lower() for k in ["master", "manifest", "playlist", "chunklist"]):
+                             print(f">> POTENTIAL MATCH: URL contains stream keyword: {url}")
+
+                        # 3. Deep Inspection
+                        if "json" in ct or "text/plain" in ct:
+                            try:
+                                body = response.text()
+                                if ".m3u8" in body or ".mpd" in body:
+                                    print(f"MATCH (Deep Inspection): Found stream key inside {ct} body!")
+                                    if "#EXTM3U" in body:
+                                         if url not in found_urls:
+                                             found_urls.append(url)
+                            except:
+                                pass
+
+                        # 4. Standard Inspection
+                        target_types = [
+                            "application/vnd.apple.mpegurl",
+                            "application/x-mpegurl",
+                            "application/dash+xml",
+                            "video/mp4"
+                        ]
+
+                        if any(t in ct for t in target_types):
+                            print(f"MATCH (MIME): Found stream via MIME: {ct}")
+                        if any(t in ct for t in target_types):
+                            print(f"MATCH (MIME): Found stream via MIME: {ct}")
+                            if url not in found_urls:
+                                found_urls.append(url)
+
+                        if ".m3u8" in url or ".mpd" in url or ".mp4" in url:
+                             print(f"MATCH (URL): Found stream via URL pattern.")
+                             if url not in found_urls:
+                                 found_urls.append(url)
+                        
+                    except Exception as e:
+                        pass
+
+                video_page.on("response", on_response)
+
+                # Fix 2: Explicitly wake up accessibility tree via Keyboard
+                print("Waking up Flutter accessibility tree via Keyboard...")
                 try:
-                    semantics_btn = video_page.get_by_label("Enable accessibility")
-                    if semantics_btn.is_visible(timeout=3000):
-                        print("Clicking 'Enable accessibility' to wake up Flutter semantics...")
-                        semantics_btn.click()
-                        video_page.wait_for_timeout(2000) # Give it time to rebuild
-                except:
-                    pass
+                    video_page.focus("flutter-view")
+                    for _ in range(3):
+                        video_page.keyboard.press("Tab")
+                        time.sleep(0.5)
+                except Exception as e:
+                    print(f"Error sending keystrokes: {e}")
 
                 print("Looking for playback button...")
                 playback_button = None
                 
-                # Strategy 1: Role
-                try:
-                    btn = video_page.get_by_role("button", name="Playback the recording")
-                    btn.wait_for(state="visible", timeout=3000)
-                    playback_button = btn
-                except:
-                    pass
-                
-                # Strategy 2: Text
-                if not playback_button:
+                # Retry loop
+                start_search = time.time()
+                while time.time() - start_search < 10:
                     try:
-                        btn = video_page.get_by_text("Playback the recording")
-                        btn.wait_for(state="visible", timeout=3000)
-                        playback_button = btn
-                    except:
-                        pass
-                
-                if playback_button:
-                    print("Clicking playback button...")
-                    playback_button.click()
-                    
-                    # Wait loop for request
-                    print("Waiting for stream URL...")
-                    start_time = time.time()
-                    while not found_url:
-                        if time.time() - start_time > 30:
-                            print("Timeout waiting for m3u8/mpd.")
+                        btn = video_page.get_by_role("button", name="Playback the recording")
+                        if btn.is_visible():
+                            playback_button = btn
                             break
-                        video_page.wait_for_timeout(500)
-                else:
-                    print("Could not find 'Playback the recording' button.")
-                    # Debug screenshot if we fail
-                    try:
-                        os.makedirs("debug_screenshots", exist_ok=True)
-                        video_page.screenshot(path=f"debug_screenshots/flutter_fail_{int(time.time())}.png")
-                        print("Screenshot saved to debug_screenshots/")
                     except:
                         pass
+                    time.sleep(1)
 
+                if playback_button:
+                    print("Found button via accessibility tree. Clicking...")
+                    playback_button.click(force=True)
+                else:
+                    print("Button not found in tree. Attempting fallback blind click...")
+                    try:
+                        video_page.locator("flutter-view").click(position={"x": 400, "y": 300}, force=True)
+                    except Exception as e:
+                        print(f"Blind click failed: {e}")
+
+                # FULL SCRUB LOOP (0% to 100%)
+                print("Waiting for stream URL and Scrubbing (Full JS Strategy)...")
+                
+                # 1. Robust Video Element Discovery (Main page + Frames)
+                video_element = None
+                try:
+                    # Give it a moment to load
+                    video_page.wait_for_timeout(5000)
+                    
+                    if video_page.locator("video").count() > 0:
+                        video_element = video_page.locator("video").first
+                        print("Found video on main page.")
+                    else:
+                        print("Video not on main page, checking frames...")
+                        for frame in video_page.frames:
+                            try:
+                                if frame.locator("video").count() > 0:
+                                    video_element = frame.locator("video").first
+                                    print(f"Found video in frame: {frame.url}")
+                                    break
+                            except:
+                                continue
+                except Exception as e:
+                    print(f"Error finding video element: {e}")
+
+                if not video_element:
+                    print("CRITICAL: Could not find <video> tag in page or frames. Scrubbing aborted.")
+                else:
+                    try:
+                        # 2. Get Duration via Evaluate Handle
+                        duration = video_element.evaluate("el => el.duration")
+                        if not duration: duration = 600
+                    except:
+                        duration = 600
+                    
+                    print(f"Video duration: {duration}s. Starting FULL scrub loop...")
+                    
+                    # Iterate 10% to 90%
+                    for i in range(1, 10): 
+                        fraction = i / 10.0
+                        target_time = duration * fraction
+                        print(f"Scrubbing to {i*10}% ({target_time}s)...")
+                        try:
+                            # 3. Jump via Evaluate Handle
+                            video_element.evaluate(f"el => el.currentTime = {target_time}")
+                        except Exception as e:
+                            print(f"Scrub jump failed: {e}")
+                        
+                        time.sleep(3.0) # Increased to 3s for reliability
+
+                print(f"Scrub complete. Found {len(found_urls)} streams.")
+            
             except Exception as e:
                 print(f"Error on Flutter page: {e}")
-            finally:
-                video_page.close()
 
         except Exception as e:
             print(f"Error in get_video_stream: {e}")
-        finally:
-            trigger_page.close()
-            context.close()
-            browser.close()
-            playwright.stop()
-
-        return found_url
+        
+        # NO FINALLY BLOCK - Keep browser open!
+        
+        return found_urls # Returns list (ordered)
